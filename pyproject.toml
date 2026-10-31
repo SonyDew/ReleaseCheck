@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sonydev-releasecheck"
+version = "0.1.0"
+description = "Read-only release readiness checks for local Git worktrees"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "SonyDev"}]
+dependencies = []
+
+[project.scripts]
+releasecheck = "releasecheck.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["releasecheck*"]
