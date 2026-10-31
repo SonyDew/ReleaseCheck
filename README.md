@@ -35,4 +35,10 @@ python -m unittest discover -s tests -v
 
 ## Limitations
 
-This is a basic local preflight check, not a complete release policy. It does not validate changelogs, version numbers, signatures, test results, CI, dependency vulnerabilities, or remote branch synchronization. It only checks common README/license filenames at the worktree root. It requires an existing commit and a non-bare worktree. Git commands have a 15-second timeout. Checks are not atomic if the repository changes during inspection.
+This is a basic local preflight check, not a complete release policy. It does not validate changelogs, version numbers, signatures, test results, CI, dependency vulnerabilities, or remote branch synchronization. It only checks common README/license filenames at the worktree root. It requires an existing commit and a non-bare worktree. Git commands have a 15-second timeout and a 4 MiB output limit. Checks are not atomic if the repository changes during inspection.
+
+## Development checks (October 31, 2026)
+
+On Linux with Python 3.13.5 and Git 2.47.3, all 34 `unittest` cases passed. The added cases cover malformed Unicode tag names, option-like tag names, staged changes, symlinked README files, blob tags, Git environment overrides, hidden filenames in text output, and bounded Git output.
+
+A wheel was built and installed in a separate virtual environment. The installed command returned `0` for a clean worktree and for a matching tag under `--strict`, `1` for an untagged worktree under `--strict` and for a missing requested tag, and `2` for an inaccessible path. JSON reports were parsed for each case. Windows and Python 3.10–3.12 were not tested.

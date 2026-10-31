@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
+import time
 
 from . import __version__
 
@@ -23,16 +25,30 @@ def _git(root: Path, *args: str) -> bytes:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+    limit = 4 * 1024 * 1024
+    started = time.monotonic()
     try:
-        result = subprocess.run(command, cwd=root, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=15, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        with subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL) as process:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert process.stdout is not None
+                reader = executor.submit(process.stdout.read, limit + 1)
+                try:
+                    output = reader.result(timeout=15)
+                    if len(output) > limit:
+                        raise InspectionError("Git output exceeds the inspection limit")
+                    process.wait(timeout=max(0.001, 15 - (time.monotonic() - started)))
+                except (FutureTimeout, subprocess.TimeoutExpired) as exc:
+                    raise InspectionError("Git could not be executed or timed out") from exc
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+    except (OSError, ValueError, UnicodeError) as exc:
         raise InspectionError("Git could not be executed or timed out") from exc
-    if result.returncode != 0:
+    if process.returncode != 0:
         raise InspectionError("Git could not inspect the repository")
-    if len(result.stdout) > 4 * 1024 * 1024:
-        raise InspectionError("Git output exceeds the inspection limit")
-    return result.stdout
+    return output
 
 
 def _document(root: Path, names: tuple[str, ...]) -> bool:
@@ -55,7 +71,11 @@ def inspect(path: str | Path, tag: str | None = None) -> list[dict[str, str]]:
     if not root.is_dir():
         raise InspectionError("Repository path is not a directory")
     top = _git(root, "rev-parse", "--show-toplevel").decode("utf-8", "surrogateescape").removesuffix("\n")
-    if Path(top).resolve() != root:
+    try:
+        matches_root = Path(top).resolve() == root
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InspectionError("Git returned an invalid worktree path") from exc
+    if not matches_root:
         raise InspectionError("Path must point to the worktree root")
     _git(root, "rev-parse", "--verify", "HEAD")
     checks: list[dict[str, str]] = []
@@ -86,7 +106,7 @@ def inspect(path: str | Path, tag: str | None = None) -> list[dict[str, str]]:
 
     head = _git(root, "rev-parse", "HEAD").strip()
     if tag is not None:
-        if not tag or any(ord(c) < 32 or ord(c) == 127 for c in tag):
+        if not tag or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in tag):
             raise InspectionError("Invalid tag name")
         try:
             _git(root, "check-ref-format", f"refs/tags/{tag}")

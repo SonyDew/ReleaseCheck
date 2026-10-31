@@ -179,5 +179,65 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
 
 
+    def test_surrogate_tag_rejected_without_traceback(self):
+        for tag in ("\ud800", "prefix\udfff"):
+            with self.subTest(tag=repr(tag)):
+                rc, out, err = self.run_cli("--tag", tag, "--json")
+                self.assertEqual(rc, 2)
+                self.assertEqual(json.loads(out)["status"], "error")
+                self.assertNotIn("prefix", out + err)
+
+    def test_tag_with_option_like_name_is_not_executed(self):
+        rc, out, err = self.run_cli("--tag=--help", "--json")
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(out)["status"], "fail")
+        self.assertEqual(err, "")
+
+    def test_dirty_index_detected(self):
+        (self.root / "README.md").write_text("staged change\n")
+        git(self.root, "add", "README.md")
+        self.assertEqual(self.checks()["worktree"]["status"], "fail")
+
+    def test_secret_filename_hidden_in_text_mode(self):
+        secret = "private-file-token-abc123"
+        (self.root / secret).write_text("value\n")
+        rc, out, err = self.run_cli()
+        self.assertEqual(rc, 1)
+        self.assertNotIn(secret, out + err)
+
+    def test_readme_symlink_not_accepted(self):
+        (self.root / "README.md").unlink()
+        try:
+            (self.root / "README.md").symlink_to(self.root / "LICENSE")
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        self.assertEqual(self.checks()["readme"]["status"], "fail")
+
+    def test_tag_pointing_to_blob_does_not_pass(self):
+        blob = git(self.root, "hash-object", "README.md").stdout.decode().strip()
+        git(self.root, "tag", "blob-tag", blob)
+        self.assertEqual(self.run_cli("--tag", "blob-tag")[0], 1)
+
+    def test_git_environment_config_override_ignored(self):
+        with patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "alias.status",
+                                         "GIT_CONFIG_VALUE_0": "!echo hacked"}):
+            self.assertEqual(self.run_cli()[0], 0)
+
+    @unittest.skipIf(os.name == "nt", "Executable fixture uses a POSIX shebang")
+    def test_git_output_limit_stops_producer(self):
+        from releasecheck.cli import _git
+        with tempfile.TemporaryDirectory() as tools_dir:
+            fake_git = Path(tools_dir) / "git"
+            fake_git.write_text("#!/usr/bin/env python3\nimport sys, time\n"
+                                "sys.stdout.buffer.write(b'x' * (4 * 1024 * 1024 + 1))\n"
+                                "sys.stdout.flush()\ntime.sleep(10)\n")
+            fake_git.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": tools_dir + os.pathsep + os.environ["PATH"]}):
+                start = __import__("time").monotonic()
+                with self.assertRaisesRegex(InspectionError, "output exceeds"):
+                    _git(self.root, "status")
+                self.assertLess(__import__("time").monotonic() - start, 5)
+
+
 if __name__ == "__main__":
     unittest.main()
