@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import queue
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 from . import __version__
@@ -19,36 +20,59 @@ class InspectionError(Exception):
     """The repository could not be inspected safely."""
 
 
+GIT_TIMEOUT_SECONDS = 15
+GIT_OUTPUT_LIMIT = 4 * 1024 * 1024
+
+
 def _git(root: Path, *args: str) -> bytes:
     command = ["git", "-c", "core.fsmonitor=false", "-c", "submodule.recurse=false", *args]
-    # Ignore caller-supplied Git overrides such as GIT_DIR and GIT_INDEX_FILE.
+    # Do not inherit Git environment overrides from the caller.
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
-    limit = 4 * 1024 * 1024
-    started = time.monotonic()
+    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
     try:
-        with subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL) as process:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                assert process.stdout is not None
-                reader = executor.submit(process.stdout.read, limit + 1)
-                try:
-                    output = reader.result(timeout=15)
-                    if len(output) > limit:
-                        raise InspectionError("Git output exceeds the inspection limit")
-                    process.wait(timeout=max(0.001, 15 - (time.monotonic() - started)))
-                except (FutureTimeout, subprocess.TimeoutExpired) as exc:
-                    raise InspectionError("Git could not be executed or timed out") from exc
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-                        process.wait()
+        process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
     except (OSError, ValueError, UnicodeError) as exc:
         raise InspectionError("Git could not be executed or timed out") from exc
-    if process.returncode != 0:
-        raise InspectionError("Git could not inspect the repository")
-    return output
+
+    # A child of Git can inherit its stdout pipe. Use a daemon reader so a
+    # timed-out read cannot hold the CLI open after Git itself is terminated.
+    result: queue.Queue[tuple[bytes | None, Exception | None]] = queue.Queue(maxsize=1)
+
+    def read_output() -> None:
+        try:
+            assert process.stdout is not None
+            result.put((process.stdout.read(GIT_OUTPUT_LIMIT + 1), None))
+        except (OSError, ValueError) as exc:
+            result.put((None, exc))
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    try:
+        try:
+            output, error = result.get(timeout=max(0.001, deadline - time.monotonic()))
+        except queue.Empty as exc:
+            raise InspectionError("Git could not be executed or timed out") from exc
+        if error is not None:
+            raise InspectionError("Git could not be executed or timed out") from error
+        assert output is not None
+        if len(output) > GIT_OUTPUT_LIMIT:
+            raise InspectionError("Git output exceeds the inspection limit")
+        try:
+            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as exc:
+            raise InspectionError("Git could not be executed or timed out") from exc
+        if process.returncode != 0:
+            raise InspectionError("Git could not inspect the repository")
+        return output
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        assert process.stdout is not None
+        process.stdout.close()
 
 
 def _document(root: Path, names: tuple[str, ...]) -> bool:
@@ -97,6 +121,22 @@ def inspect(path: str | Path, tag: str | None = None) -> list[dict[str, str]]:
     add("gitignore", "pass" if ignore else "warn",
         ".gitignore found" if ignore else ".gitignore missing or empty")
 
+    git_dir = Path(_git(root, "rev-parse", "--absolute-git-dir")
+                   .decode("utf-8", "surrogateescape").removesuffix("\n"))
+    active = False
+    for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD",
+                   "rebase-apply", "rebase-merge", "sequencer", "BISECT_LOG"):
+        try:
+            (git_dir / marker).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise InspectionError("Git operation state could not be inspected") from exc
+        active = True
+        break
+    add("operation", "fail" if active else "pass",
+        "Git operation in progress" if active else "No Git operation in progress")
+
     # A detached HEAD is valid for a release build, but deserves review.
     try:
         _git(root, "symbolic-ref", "--quiet", "HEAD")
@@ -126,8 +166,14 @@ def inspect(path: str | Path, tag: str | None = None) -> list[dict[str, str]]:
     return checks
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        # argparse normally echoes invalid options, which may contain secrets.
+        self.exit(2, "releasecheck: invalid arguments\n")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Check a local Git worktree before a release.")
+    parser = _SafeArgumentParser(description="Check a local Git worktree before a release.")
     parser.add_argument("path", nargs="?", default=".", help="Git worktree root (default: current directory)")
     parser.add_argument("--tag", help="Require this tag to point to HEAD")
     parser.add_argument("--strict", action="store_true", help="Treat warnings as failures")

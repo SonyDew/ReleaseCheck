@@ -1,14 +1,14 @@
 # ReleaseCheck
 
-A read-only CLI for checking basic release readiness in a local Git worktree.
+A read-only CLI for basic release checks in a local Git worktree.
 
-**Status:** In Development (SonyDev GitHub Marathon, Day 5, October 31, 2026).
+**Status:** Completed MVP (SonyDev GitHub Marathon, Day 5, October 31, 2026). This is not a release certification tool.
 
-ReleaseCheck checks whether the worktree is clean, whether a nonempty README and license file exist, whether `.gitignore` exists, whether HEAD is on a branch, and whether HEAD is tagged. You can require a specific tag. It does not publish releases or run project code.
+ReleaseCheck checks for pending tracked or untracked changes, a nonempty README and license, a nonempty `.gitignore`, an unfinished Git operation, a detached HEAD, and a tag at HEAD. A specific lightweight or annotated tag can be required.
 
 ## Install and run
 
-Requires Python 3.10+ and Git. No runtime Python dependencies.
+Requires Python 3.10+ and Git. There are no runtime Python dependencies.
 
 ```sh
 python -m pip install .
@@ -23,9 +23,15 @@ Without installing:
 python -m releasecheck /path/to/project --json
 ```
 
-Exit codes: `0` means no blocking checks; `1` means a check failed (or a warning under `--strict`); `2` means the repository could not be inspected. Without `--strict`, warnings do not block. A missing README or license and a dirty worktree always fail. A missing `.gitignore`, detached HEAD, or untagged HEAD warns unless `--strict` is set. `--tag` requires the named lightweight or annotated tag to resolve to HEAD.
+Exit codes:
 
-The tool does not print filenames from `git status`, tag names, remote URLs, file contents, or Git error output. It reads metadata and does not modify the repository. Ignored files are not counted as pending changes.
+- `0`: no blocking checks.
+- `1`: at least one failed check, or a warning with `--strict`.
+- `2`: invalid arguments or an inspection error.
+
+A dirty worktree, missing README or license, an unfinished Git operation, or a requested tag not pointing to HEAD is a failure. Missing `.gitignore`, detached HEAD, and no tag at HEAD are warnings unless `--strict` is used. Ignored files are excluded from the worktree check. The operation check looks for merge, rebase, cherry-pick, revert, sequencer, and bisect state markers.
+
+Reports do not include filenames from `git status`, file contents, tag names, remote URLs, or Git stderr. Invalid CLI options are not echoed. Inspection uses file metadata and Git commands; it does not write to the repository.
 
 ## Tests
 
@@ -35,10 +41,8 @@ python -m unittest discover -s tests -v
 
 ## Limitations
 
-This is a basic local preflight check, not a complete release policy. It does not validate changelogs, version numbers, signatures, test results, CI, dependency vulnerabilities, or remote branch synchronization. It only checks common README/license filenames at the worktree root. It requires an existing commit and a non-bare worktree. Git commands have a 15-second timeout and a 4 MiB output limit. Checks are not atomic if the repository changes during inspection.
+This is a local preflight check, not a full release policy. It does not verify changelogs, version numbers, signatures, test results, CI, dependency vulnerabilities, or remote branch synchronization. README and license checks recognize common filenames only at the worktree root. They check for nonzero file size, not document validity. A Git worktree with an existing commit is required. Git commands have a 15-second timeout and a 4 MiB output limit. Concurrent changes to the repository may produce inconsistent results. Command-line parsing errors are printed to stderr, including when `--json` is requested.
 
-## Development checks (October 31, 2026)
+## Development report — October 31, 2026
 
-On Linux with Python 3.13.5 and Git 2.47.3, all 34 `unittest` cases passed. The added cases cover malformed Unicode tag names, option-like tag names, staged changes, symlinked README files, blob tags, Git environment overrides, hidden filenames in text output, and bounded Git output.
-
-A wheel was built and installed in a separate virtual environment. The installed command returned `0` for a clean worktree and for a matching tag under `--strict`, `1` for an untagged worktree under `--strict` and for a missing requested tag, and `2` for an inaccessible path. JSON reports were parsed for each case. Windows and Python 3.10–3.12 were not tested.
+On Linux with Python 3.13.5 and Git 2.47.3, all 44 `unittest` cases passed. Tests include a clean worktree with a pending merge, Git operation markers in a linked worktree, malformed tag names, symlinks, staged and untracked changes, a Git output-size limit, and a timeout when a Git child retains the output pipe. The CLI was also tested after installing a locally built wheel. Windows and Python 3.10–3.12 were not tested.

@@ -129,7 +129,7 @@ class ReleaseCheckTests(unittest.TestCase):
         report = json.loads(out)
         self.assertEqual(rc, 0)
         self.assertEqual(report["status"], "pass")
-        self.assertEqual(len(report["checks"]), 6)
+        self.assertEqual(len(report["checks"]), 7)
 
     def test_invalid_tag_name_sanitized(self):
         rc, out, err = self.run_cli("--tag", "secret\nname", "--json")
@@ -178,7 +178,6 @@ class ReleaseCheckTests(unittest.TestCase):
             main(["--version"])
         self.assertEqual(raised.exception.code, 0)
 
-
     def test_surrogate_tag_rejected_without_traceback(self):
         for tag in ("\ud800", "prefix\udfff"):
             with self.subTest(tag=repr(tag)):
@@ -222,6 +221,85 @@ class ReleaseCheckTests(unittest.TestCase):
         with patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "alias.status",
                                          "GIT_CONFIG_VALUE_0": "!echo hacked"}):
             self.assertEqual(self.run_cli()[0], 0)
+
+    def test_clean_merge_in_progress_fails(self):
+        git(self.root, "checkout", "-qb", "feature")
+        git(self.root, "commit", "--allow-empty", "-qm", "empty")
+        git(self.root, "checkout", "-q", "master")
+        git(self.root, "merge", "--no-commit", "--no-ff", "feature")
+        self.assertEqual(self.checks()["worktree"]["status"], "pass")
+        self.assertEqual(self.checks()["operation"]["status"], "fail")
+        self.assertEqual(self.run_cli()[0], 1)
+        git(self.root, "merge", "--abort")
+        self.assertEqual(self.checks()["operation"]["status"], "pass")
+
+    def test_rebase_marker_detected(self):
+        (self.root / ".git" / "rebase-merge").mkdir()
+        self.assertEqual(self.checks()["operation"]["status"], "fail")
+
+    def test_cherry_pick_marker_detected(self):
+        (self.root / ".git" / "CHERRY_PICK_HEAD").write_text("placeholder")
+        self.assertEqual(self.checks()["operation"]["status"], "fail")
+
+    def test_linked_worktree_operation_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            linked = Path(directory) / "linked"
+            git(self.root, "worktree", "add", "--detach", "-q", str(linked))
+            gitdir = Path(git(linked, "rev-parse", "--absolute-git-dir").stdout.decode().strip())
+            (gitdir / "MERGE_HEAD").write_text("placeholder")
+            self.assertEqual({c["name"]: c["status"] for c in inspect(linked)}["operation"], "fail")
+
+    def test_invalid_option_does_not_echo_input(self):
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit) as raised:
+                main([str(self.root), "--secret-password-value"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertNotIn("secret-password-value", output.getvalue())
+
+    def test_untracked_directory_detected(self):
+        directory = self.root / "untracked"
+        directory.mkdir()
+        (directory / "file.txt").write_text("content")
+        self.assertEqual(self.checks()["worktree"]["status"], "fail")
+
+    def test_empty_gitignore_warns(self):
+        (self.root / ".gitignore").write_text("")
+        self.assertEqual(self.checks()["gitignore"]["status"], "warn")
+
+    def test_non_directory_path_error_sanitized(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = main([str(self.root / "README.md"), "--json"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(output.getvalue())["status"], "error")
+        self.assertNotIn(str(self.root), output.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "Executable fixture uses a POSIX shebang")
+    def test_git_timeout_with_inherited_stdout(self):
+        from releasecheck import cli
+        with tempfile.TemporaryDirectory() as tools_dir:
+            fake_git = Path(tools_dir) / "git"
+            fake_git.write_text("#!/usr/bin/env python3\nimport subprocess, sys\n"
+                                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'])\n")
+            fake_git.chmod(0o755)
+            with patch.object(cli, "GIT_TIMEOUT_SECONDS", 0.3), patch.dict(
+                    os.environ, {"PATH": tools_dir + os.pathsep + os.environ["PATH"]}):
+                start = __import__("time").monotonic()
+                with self.assertRaisesRegex(InspectionError, "timed out"):
+                    cli._git(self.root, "status")
+                self.assertLess(__import__("time").monotonic() - start, 1.5)
+
+    @unittest.skipIf(os.name == "nt", "Executable fixture uses a POSIX shebang")
+    def test_git_output_limit_exactly_allowed(self):
+        from releasecheck import cli
+        with tempfile.TemporaryDirectory() as tools_dir:
+            fake_git = Path(tools_dir) / "git"
+            fake_git.write_text("#!/usr/bin/env python3\nimport sys\n"
+                                "sys.stdout.buffer.write(b'x' * (4 * 1024 * 1024))\n")
+            fake_git.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": tools_dir + os.pathsep + os.environ["PATH"]}):
+                self.assertEqual(len(cli._git(self.root, "status")), 4 * 1024 * 1024)
 
     @unittest.skipIf(os.name == "nt", "Executable fixture uses a POSIX shebang")
     def test_git_output_limit_stops_producer(self):
